@@ -1,0 +1,542 @@
+<script>
+(function () {
+  'use strict';
+
+  var SOON_DAYS = 7;       // 「7日以内に期限」
+  var STALE_DAYS = 7;      // 最新の対応がこの日数より前なら日数を赤にする
+  var HANDOVER_DAYS = 7;   // 引き継ぎの印を出す日数
+  var STATUS_CLASS = { '未着手': 's-todo', '進行中': 's-doing', '確認待ち': 's-wait', '保留': 's-hold', '完了': 's-done' };
+  var SYSTEM_KINDS = ['ステータス変更', '期限変更'];
+  var HANDOVER = '引き継ぎ';
+  var COLORS = ['#2e8b57', '#1f5fbf', '#7b5ea7', '#a86a12', '#2f7f8a', '#b0413e', '#5c6b7a', '#8a5a44'];
+  var DEFAULT_FILTER = { owner: 'all', status: 'open', late: false, soon: false };
+
+  var state = {
+    user: null, users: [], clients: [], statuses: [], kinds: [], today: '',
+    cases: [], feed: [], current: null, clientList: [], histAll: [],
+    filter: copy(DEFAULT_FILTER),
+    logKind: 'メモ',
+    hist: { by: 'all', kind: 'all' }
+  };
+
+  /* ---------- サーバ呼び出し ---------- */
+  function call(fn) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return new Promise(function (resolve, reject) {
+      var runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(reject);
+      runner[fn].apply(runner, args);
+    });
+  }
+
+  /* ---------- 小道具 ---------- */
+  function $(id) { return document.getElementById(id); }
+  function copy(o) { return JSON.parse(JSON.stringify(o)); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function errText(e) { var m = (e && e.message) ? e.message : String(e); return m.replace(/^Error:\s*/, ''); }
+  function toTime(ymd) { return new Date(Number(ymd.slice(0, 4)), Number(ymd.slice(5, 7)) - 1, Number(ymd.slice(8, 10))).getTime(); }
+  function daysFromToday(ymd) { return Math.round((toTime(ymd) - toTime(state.today)) / 86400000); }
+  function weekday(ymd) { return '日月火水木金土'.charAt(new Date(toTime(ymd)).getDay()); }
+  function md(ymd) { return Number(ymd.slice(5, 7)) + '/' + Number(ymd.slice(8, 10)) + '（' + weekday(ymd) + '）'; }
+  function mdShort(s) { return Number(s.slice(5, 7)) + '/' + Number(s.slice(8, 10)); }
+  function longDate(ymd) { return ymd.slice(0, 4) + '年' + Number(ymd.slice(5, 7)) + '月' + Number(ymd.slice(8, 10)) + '日（' + weekday(ymd) + '）'; }
+  function canWrite() { return !!state.user && (state.user.role === '入力' || state.user.role === '管理'); }
+  function isOpen(c) { return c.status !== '完了'; }
+  function isLate(c) { return isOpen(c) && daysFromToday(c.due) < 0; }
+  function isSoon(c) { var d = daysFromToday(c.due); return isOpen(c) && d >= 0 && d <= SOON_DAYS; }
+  function userByEmail(email) { return state.users.filter(function (u) { return u.email === email; })[0]; }
+  function ownerCandidates() { return state.users.filter(function (u) { return u.role === '入力' || u.role === '管理'; }); }
+
+  function av(email, name) {
+    var i = state.users.map(function (u) { return u.email; }).indexOf(email);
+    var color = COLORS[(i < 0 ? COLORS.length - 1 : i) % COLORS.length];
+    return '<span class="av" style="background:' + color + '">' + esc(String(name || '?').charAt(0)) + '</span>';
+  }
+  function statusBadge(s) { return '<span class="badge ' + (STATUS_CLASS[s] || '') + '">' + esc(s) + '</span>'; }
+  function dueBadge(c) {
+    if (!isOpen(c)) return '';
+    var d = daysFromToday(c.due);
+    if (d < 0) return '<span class="badge b-late">' + (-d) + '日超過</span>';
+    if (d === 0) return '<span class="badge b-late">今日まで</span>';
+    if (d <= SOON_DAYS) return '<span class="badge b-soon">あと' + d + '日</span>';
+    return '<span class="due-later">あと' + d + '日</span>';
+  }
+
+  var toastTimer = null;
+  function toast(msg, kind) {
+    var t = $('toast');
+    t.textContent = msg;
+    t.className = 'toast ' + (kind || '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.classList.add('hidden'); }, 2600);
+  }
+  function fail(e) { toast(errText(e), 'warn'); }
+  function showAlert(id, msg) { var a = $(id); if (!a) return; a.textContent = msg || ''; a.classList.toggle('hidden', !msg); }
+  function markBad(id, bad) { var e = $(id); if (e) e.classList.toggle('bad', !!bad); }
+  function modal(html) { $('modalBox').innerHTML = html; $('modal').classList.remove('hidden'); }
+  // 入力し直したら、その欄の赤枠とエラー文を消す（まだ足りなければ次に押したときにまた出る）
+  function clearError(e) {
+    var box = e.target.closest ? e.target.closest('.modal-box, .log-form') : null;
+    if (!box) return;
+    e.target.classList.remove('bad');
+    box.querySelectorAll('.alert, .inline-alert').forEach(function (a) { a.classList.add('hidden'); });
+  }
+  $('modalBox').addEventListener('input', clearError);
+  $('modalBox').addEventListener('change', clearError);
+  function closeModal() { $('modal').classList.add('hidden'); $('modalBox').innerHTML = ''; }
+  $('modal').addEventListener('mousedown', function (e) { if (e.target === $('modal')) closeModal(); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !$('modal').classList.contains('hidden')) closeModal(); });
+
+  /** 押したボタンを処理が終わるまで押せなくする（二重登録を防ぐ） */
+  function busy(btn, promise) {
+    if (btn) btn.disabled = true;
+    return promise.then(function (r) { if (btn) btn.disabled = false; return r; }, function (e) { if (btn) btn.disabled = false; throw e; });
+  }
+
+  /* ---------- 画面切替 ---------- */
+  var TITLES = { cases: '案件一覧', 'case': '案件一覧', clients: '取引先', history: '対応履歴' };
+  function showView(name) {
+    document.querySelectorAll('.view').forEach(function (v) { v.classList.toggle('hidden', v.id !== 'view-' + name); });
+    var navKey = name === 'case' ? 'cases' : name;
+    document.querySelectorAll('.nav-item').forEach(function (b) { b.classList.toggle('active', b.dataset.view === navKey); });
+    $('viewTitle').textContent = TITLES[name];
+    $('btnNewCase').classList.toggle('hidden', !(canWrite() && (name === 'cases' || name === 'case')));
+    $('btnNewClient').classList.toggle('hidden', !(canWrite() && name === 'clients'));
+    window.scrollTo(0, 0);
+  }
+  document.querySelectorAll('.nav-item').forEach(function (b) {
+    b.addEventListener('click', function () {
+      if (b.dataset.view === 'cases') loadCases();
+      if (b.dataset.view === 'clients') loadClients();
+      if (b.dataset.view === 'history') loadHistory();
+    });
+  });
+
+  /* ---------- 起動 ---------- */
+  call('apiBootstrap').then(function (b) {
+    state.user = b.user; state.users = b.users; state.clients = b.clients;
+    state.statuses = b.statuses; state.kinds = b.kinds; state.today = b.today;
+    $('userName').textContent = b.user.name;
+    $('userRole').textContent = '権限: ' + b.user.role;
+    $('todayLabel').textContent = longDate(b.today);
+    fillOwnerFilter();
+    fillHistoryFilters();
+    return loadCases();
+  }).catch(fail);
+
+  /* ============================================================
+   * 案件一覧（TOP）
+   * ============================================================ */
+
+  function loadCases() {
+    return call('apiListCases').then(function (r) {
+      state.cases = r.cases;
+      state.feed = r.history;
+      renderCases();
+      showView('cases');
+    }).catch(fail);
+  }
+
+  function fillOwnerFilter() {
+    var me = state.user;
+    var others = ownerCandidates().filter(function (u) { return u.email !== me.email; });
+    var html = '<option value="all">すべての担当者</option>';
+    if (canWrite()) html += '<option value="' + esc(me.email) + '">自分（' + esc(me.short) + '）</option>';
+    html += others.map(function (u) { return '<option value="' + esc(u.email) + '">' + esc(u.short) + '</option>'; }).join('');
+    $('fOwner').innerHTML = html;
+  }
+
+  var SEG = [
+    { key: 'open', label: '完了以外' }, { key: '未着手', label: '未着手' }, { key: '進行中', label: '進行中' },
+    { key: '確認待ち', label: '確認待ち' }, { key: '保留', label: '保留' }, { key: '完了', label: '完了' }
+  ];
+
+  function matchOwner(c) { return state.filter.owner === 'all' || c.owner === state.filter.owner; }
+  function matchDue(c) {
+    var f = state.filter;
+    if (!f.late && !f.soon) return true;
+    return (f.late && isLate(c)) || (f.soon && isSoon(c));
+  }
+  function matchStatus(c, key) {
+    key = key || state.filter.status;
+    return key === 'open' ? isOpen(c) : c.status === key;
+  }
+  function sameFilter(a) { return JSON.stringify(a) === JSON.stringify(state.filter); }
+
+  function kpiDefs() {
+    var me = state.user.email;
+    return [
+      { key: 'mine', label: '自分の担当', cls: '', count: function (c) { return c.owner === me && isOpen(c); }, preset: { owner: me, status: 'open', late: false, soon: false } },
+      { key: 'late', label: '期限切れ', cls: 'late', count: isLate, preset: { owner: 'all', status: 'open', late: true, soon: false } },
+      { key: 'soon', label: SOON_DAYS + '日以内に期限', cls: 'soon', count: isSoon, preset: { owner: 'all', status: 'open', late: false, soon: true } },
+      { key: 'wait', label: '確認待ち', cls: '', count: function (c) { return c.status === '確認待ち'; }, preset: { owner: 'all', status: '確認待ち', late: false, soon: false } }
+    ];
+  }
+
+  function visibleCases() {
+    var rows = state.cases.filter(function (c) { return matchOwner(c) && matchDue(c) && matchStatus(c); });
+    return rows.sort(function (a, b) {
+      if (isOpen(a) !== isOpen(b)) return isOpen(a) ? -1 : 1;
+      if (a.due !== b.due) return isOpen(a) ? (a.due < b.due ? -1 : 1) : (a.due < b.due ? 1 : -1);
+      return a.no < b.no ? -1 : 1;
+    });
+  }
+
+  function renderCases() {
+    var rows = visibleCases();
+    renderKpis();
+    renderFilters();
+    renderCaseTable(rows);
+    renderFeed(rows);
+  }
+
+  function renderKpis() {
+    $('kpis').innerHTML = kpiDefs().map(function (k) {
+      var n = state.cases.filter(k.count).length;
+      return '<button class="kpi ' + k.cls + (sameFilter(k.preset) ? ' on' : '') + '" data-kpi="' + k.key + '">' +
+        '<div class="k">' + esc(k.label) + '</div><div class="v">' + n + '<small>件</small></div></button>';
+    }).join('');
+  }
+
+  function renderFilters() {
+    var f = state.filter;
+    $('fOwner').value = f.owner;
+    var base = state.cases.filter(function (c) { return matchOwner(c) && matchDue(c); });
+    $('fStatus').innerHTML = SEG.map(function (s) {
+      var n = base.filter(function (c) { return matchStatus(c, s.key); }).length;
+      return '<button data-status="' + esc(s.key) + '" class="' + (f.status === s.key ? 'on' : '') + '">' + esc(s.label) + '<span class="ct">' + n + '</span></button>';
+    }).join('');
+    [['fLate', f.late], ['fSoon', f.soon]].forEach(function (p) {
+      $(p[0]).classList.toggle('on', p[1]);
+      $(p[0]).setAttribute('aria-pressed', String(p[1]));
+    });
+    $('fClear').classList.toggle('hidden', sameFilter(DEFAULT_FILTER));
+  }
+
+  function lastCell(c) {
+    var h = c.last;
+    if (!h) return '<div class="last-h">対応履歴はまだありません</div>';
+    var ago = -daysFromToday(h.at.slice(0, 10));
+    var hand = h.kind === HANDOVER;
+    var who = hand ? esc(h.beforeName) + ' → ' + esc(h.afterName) : esc(h.byName);
+    return '<div class="last-h"><span class="kind' + (hand ? ' k-hand' : '') + '">' + esc(h.kind) + '</span>' +
+      '<span>' + mdShort(h.at) + '</span><span>' + who + '</span>' +
+      '<span class="' + (isOpen(c) && ago >= STALE_DAYS ? 'stale' : '') + '">' + (ago === 0 ? '今日' : ago + '日前') + '</span></div>' +
+      '<div class="last-t" title="' + esc(h.text) + '">' + esc(h.text) + '</div>';
+  }
+
+  function renderCaseTable(rows) {
+    var tb = $('tblCases').querySelector('tbody');
+    $('caseCount').textContent = rows.length + '件';
+    if (!rows.length) { tb.innerHTML = '<tr class="empty"><td colspan="5">条件に合う案件はありません</td></tr>'; return; }
+    tb.innerHTML = rows.map(function (c) {
+      var hand = c.handover && -daysFromToday(c.handover.at.slice(0, 10)) <= HANDOVER_DAYS ? c.handover : null;
+      var due = dueBadge(c);
+      return '<tr class="click' + (isOpen(c) ? '' : ' done') + '" data-no="' + esc(c.no) + '">' +
+        '<td><div class="due-d">' + md(c.due) + '</div>' + (due ? '<div class="due-sub">' + due + '</div>' : '') + '</td>' +
+        '<td><div class="case-t">' + esc(c.title) + '</div><div class="case-c">' + esc(c.clientName) + '</div></td>' +
+        '<td class="owner-wrap"><div class="owner">' + av(c.owner, c.ownerName) + '<span>' + esc(c.ownerName) + '</span></div>' +
+          (hand ? '<span class="badge b-hand">' + mdShort(hand.at) + ' 引き継ぎ</span>' : '') + '</td>' +
+        '<td>' + statusBadge(c.status) + '</td>' +
+        '<td>' + lastCell(c) + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function renderFeed(rows) {
+    var nos = {};
+    rows.forEach(function (c) { nos[c.no] = true; });
+    var items = state.feed.filter(function (h) { return nos[h.caseNo]; });
+    $('feed').innerHTML = items.length ? items.map(function (h) { return entryHtml(h, true); }).join('')
+      : '<li class="fi"><div class="fi-text muted">対応履歴はありません</div></li>';
+  }
+
+  /** 対応履歴の1件。showCase のときは案件名と取引先も出す */
+  function entryHtml(h, showCase) {
+    var hand = h.kind === HANDOVER;
+    var sys = SYSTEM_KINDS.indexOf(h.kind) >= 0;
+    var who = hand
+      ? av(h.before, h.beforeName) + '<b>' + esc(h.beforeName) + '</b><span class="arrow">→</span>' + av(h.after, h.afterName) + '<b>' + esc(h.afterName) + '</b>'
+      : av(h.by, h.byName) + '<b>' + esc(h.byName) + '</b>';
+    var html = '<li class="fi' + (hand ? ' hand' : '') + (sys ? ' sys' : '') + '"' + (showCase ? ' data-no="' + esc(h.caseNo) + '"' : '') + '>' +
+      '<div class="fi-h">' + who + '<span class="kind' + (hand ? ' k-hand' : sys ? ' k-sys' : '') + '">' + esc(h.kind) + '</span>' +
+      '<span class="time">' + mdShort(h.at) + ' ' + esc(h.at.slice(11, 16)) + '</span></div>';
+    if (showCase) html += '<div class="fi-case">' + esc(h.caseTitle) + '</div><div class="fi-client">' + esc(h.clientName) + '</div>';
+    if (h.kind === 'ステータス変更') html += '<div class="fi-change">' + statusBadge(h.before) + '<span class="arrow">→</span>' + statusBadge(h.after) + '</div>';
+    if (h.kind === '期限変更') html += '<div class="fi-change">' + md(h.before) + '<span class="arrow">→</span>' + md(h.after) + '</div>';
+    if (h.text) html += '<div class="fi-text">' + esc(h.text) + '</div>';
+    if (hand && h.by !== h.before) html += '<div class="fi-by">記入: ' + esc(h.byName) + '</div>';
+    return html + '</li>';
+  }
+
+  $('fOwner').addEventListener('change', function () { state.filter.owner = this.value; renderCases(); });
+  $('fStatus').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-status]'); if (!b) return;
+    state.filter.status = b.dataset.status; renderCases();
+  });
+  $('fLate').addEventListener('click', function () { state.filter.late = !state.filter.late; renderCases(); });
+  $('fSoon').addEventListener('click', function () { state.filter.soon = !state.filter.soon; renderCases(); });
+  $('fClear').addEventListener('click', function () { state.filter = copy(DEFAULT_FILTER); renderCases(); });
+  $('kpis').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-kpi]'); if (!b) return;
+    var k = kpiDefs().filter(function (x) { return x.key === b.dataset.kpi; })[0];
+    state.filter = sameFilter(k.preset) ? copy(DEFAULT_FILTER) : copy(k.preset);
+    renderCases();
+  });
+  $('tblCases').querySelector('tbody').addEventListener('click', function (e) {
+    var tr = e.target.closest('tr[data-no]'); if (tr) openCase(tr.dataset.no);
+  });
+  $('feed').addEventListener('click', function (e) {
+    var li = e.target.closest('li[data-no]'); if (li) openCase(li.dataset.no);
+  });
+  $('btnNewCase').addEventListener('click', function () { openCaseForm(null); });
+
+  /* ============================================================
+   * 案件の詳細
+   * ============================================================ */
+
+  function openCase(no) {
+    return call('apiGetCase', no).then(function (c) {
+      state.current = c;
+      renderCase();
+      showView('case');
+    }).catch(fail);
+  }
+  function reloadCase() {
+    return call('apiGetCase', state.current.no).then(function (c) { state.current = c; renderCase(); });
+  }
+
+  function renderCase() {
+    var c = state.current;
+    var w = canWrite();
+    $('cTitle').textContent = c.title;
+    $('cBadges').innerHTML = statusBadge(c.status);
+    $('cSub').textContent = c.clientName + '　案件番号 ' + c.no;
+    var cl = c.client || {};
+    var contact = [cl.contact, cl.phone].filter(function (x) { return x; }).map(esc).join('　');
+    $('cClient').innerHTML = esc(c.clientName) + (contact ? '<div class="sub">' + contact + '</div>' : '') + (cl.email ? '<div class="sub">' + esc(cl.email) + '</div>' : '');
+    $('cOwner').innerHTML = av(c.owner, c.ownerName) + '<span>' + esc(c.ownerFull) + '</span>';
+    $('cStatus').innerHTML = state.statuses.map(function (s) {
+      return '<button data-status="' + esc(s) + '" class="' + (s === c.status ? 'on' : '') + '"' + (w ? '' : ' disabled') + '>' + esc(s) + '</button>';
+    }).join('');
+    var due = dueBadge(c);
+    $('cDue').innerHTML = '<span class="due-d">' + md(c.due) + '</span>' + (due ? ' ' + due : '');
+    $('cNote').textContent = c.note || '—';
+    $('cCreated').textContent = c.createdBy + '　' + c.createdAt.replace(/-/g, '/');
+    $('cLogCount').textContent = c.history.length + '件';
+    $('cTimeline').innerHTML = c.history.length ? c.history.map(function (h) { return entryHtml(h, false); }).join('')
+      : '<li class="fi"><div class="fi-text muted">対応履歴はまだありません</div></li>';
+    $('btnEditCase').disabled = !w;
+    $('btnHandover').disabled = !w;
+    $('btnAddLog').disabled = !w;
+    $('hText').disabled = !w;
+    renderKinds();
+  }
+
+  function renderKinds() {
+    var w = canWrite();
+    $('hKinds').innerHTML = state.kinds.map(function (k) {
+      return '<button type="button" class="chip pick' + (k === state.logKind ? ' on' : '') + '" data-kind="' + esc(k) + '"' + (w ? '' : ' disabled') + '>' + esc(k) + '</button>';
+    }).join('');
+  }
+
+  $('btnBack').addEventListener('click', function () { loadCases(); });
+
+  $('cStatus').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-status]');
+    if (!b || b.disabled || b.dataset.status === state.current.status) return;
+    var s = b.dataset.status;
+    busy(b, call('apiSetStatus', state.current.no, s, '')).then(function () {
+      toast('ステータスを「' + s + '」にしました', 'ok');
+      return reloadCase();
+    }).catch(fail);
+  });
+
+  $('hText').addEventListener('input', clearError);
+
+  $('hKinds').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-kind]'); if (!b || b.disabled) return;
+    state.logKind = b.dataset.kind; renderKinds();
+  });
+
+  $('btnAddLog').addEventListener('click', function () {
+    var text = $('hText').value;
+    showAlert('hAlert', '');
+    markBad('hText', false);
+    busy($('btnAddLog'), call('apiAddHistory', state.current.no, { kind: state.logKind, text: text })).then(function () {
+      $('hText').value = '';
+      toast('対応履歴に記録しました', 'ok');
+      return reloadCase();
+    }).catch(function (e) {
+      showAlert('hAlert', errText(e));
+      markBad('hText', !text.trim());
+    });
+  });
+
+  $('btnEditCase').addEventListener('click', function () { openCaseForm(state.current); });
+
+  $('btnHandover').addEventListener('click', function () {
+    var c = state.current;
+    var opts = ownerCandidates().filter(function (u) { return u.email !== c.owner; }).map(function (u) {
+      return '<option value="' + esc(u.email) + '">' + esc(u.name) + '</option>';
+    }).join('');
+    modal('<h3>担当者を変更</h3><p class="modal-sub">' + esc(c.title) + '　' + esc(c.clientName) + '</p>' +
+      '<div class="form-grid2">' +
+        '<div class="field"><span class="cap">今の担当者</span><div class="static">' + av(c.owner, c.ownerName) + esc(c.ownerFull) + '</div></div>' +
+        '<label><span class="cap">新しい担当者 <span class="req">必須</span></span><select id="hoTo"><option value="">選んでください</option>' + opts + '</select></label>' +
+        '<label class="span2"><span class="cap">申し送り <span class="req">必須</span></span>' +
+          '<textarea id="hoMemo" rows="5" placeholder="進み具合、先方とのやり取りで気をつけること、次にやること"></textarea></label>' +
+      '</div>' +
+      '<div class="alert hidden" id="hoAlert"></div>' +
+      '<div class="actions"><button class="btn" id="hoCancel">閉じる</button><button class="btn primary" id="hoSave">引き継ぐ</button></div>');
+    $('hoCancel').onclick = closeModal;
+    $('hoSave').onclick = function () {
+      var to = $('hoTo').value, memo = $('hoMemo').value;
+      markBad('hoTo', !to);
+      markBad('hoMemo', !memo.trim());
+      busy($('hoSave'), call('apiHandover', c.no, { to: to, memo: memo })).then(function () {
+        var u = userByEmail(to);
+        closeModal();
+        toast((u ? u.short : to) + 'さんに引き継ぎました', 'ok');
+        return reloadCase();
+      }).catch(function (e) { showAlert('hoAlert', errText(e)); });
+    };
+    $('hoTo').focus();
+  });
+
+  /** 案件の登録（c が null）と編集 */
+  function openCaseForm(c) {
+    var isNew = !c;
+    var me = state.user;
+    var clientOpts = state.clients.map(function (x) {
+      return '<option value="' + esc(x.id) + '"' + (c && c.clientId === x.id ? ' selected' : '') + '>' + esc(x.name) + '</option>';
+    }).join('');
+    var ownerOpts = ownerCandidates().map(function (u) {
+      return '<option value="' + esc(u.email) + '"' + (u.email === me.email ? ' selected' : '') + '>' + esc(u.email === me.email ? '自分（' + u.short + '）' : u.name) + '</option>';
+    }).join('');
+    var statusOpts = state.statuses.map(function (s) { return '<option value="' + esc(s) + '">' + esc(s) + '</option>'; }).join('');
+    modal('<h3>' + (isNew ? '案件を登録' : '案件を編集') + '</h3>' + (isNew ? '<div style="height:12px"></div>' : '<p class="modal-sub">' + esc(c.no) + '</p>') +
+      '<div class="form-grid2">' +
+        '<label class="span2"><span class="cap">案件名 <span class="req">必須</span></span><input id="fTitle" type="text" maxlength="100" value="' + esc(c ? c.title : '') + '"></label>' +
+        '<label><span class="cap">取引先 <span class="req">必須</span></span><select id="fClient"><option value="">選んでください</option>' + clientOpts + '</select></label>' +
+        '<label><span class="cap">期限 <span class="req">必須</span></span><input id="fDue" type="date" value="' + esc(c ? c.due : '') + '"></label>' +
+        (isNew
+          ? '<label><span class="cap">担当者 <span class="req">必須</span></span><select id="fOwner2">' + ownerOpts + '</select></label>' +
+            '<label><span class="cap">ステータス</span><select id="fStatus2">' + statusOpts + '</select></label>'
+          : '') +
+        '<label class="span2"><span class="cap">内容</span><textarea id="fNote" rows="4">' + esc(c ? c.note : '') + '</textarea></label>' +
+      '</div>' +
+      '<div class="alert hidden" id="fAlert"></div>' +
+      '<div class="actions"><button class="btn" id="fCancel">閉じる</button><button class="btn primary" id="fSave">' + (isNew ? '登録する' : '保存する') + '</button></div>');
+    $('fCancel').onclick = closeModal;
+    $('fSave').onclick = function () {
+      var p = { no: isNew ? '' : c.no, title: $('fTitle').value, clientId: $('fClient').value, due: $('fDue').value, note: $('fNote').value };
+      if (isNew) { p.owner = $('fOwner2').value; p.status = $('fStatus2').value; }
+      markBad('fTitle', !p.title.trim());
+      markBad('fClient', !p.clientId);
+      markBad('fDue', !p.due);
+      busy($('fSave'), call('apiSaveCase', p)).then(function (r) {
+        closeModal();
+        toast(isNew ? '案件を登録しました' : '案件を保存しました', 'ok');
+        return openCase(r.no);
+      }).catch(function (e) { showAlert('fAlert', errText(e)); });
+    };
+    $('fTitle').focus();
+  }
+
+  /* ============================================================
+   * 取引先
+   * ============================================================ */
+
+  function loadClients() {
+    return call('apiListClients').then(function (list) {
+      state.clientList = list;
+      state.clients = list;
+      renderClients();
+      showView('clients');
+    }).catch(fail);
+  }
+
+  function renderClients() {
+    var list = state.clientList;
+    $('clientCount').textContent = list.length + '社';
+    $('tblClients').querySelector('tbody').innerHTML = list.map(function (c) {
+      return '<tr class="click" data-id="' + esc(c.id) + '"><td><b>' + esc(c.name) + '</b></td><td>' + esc(c.contact) + '</td><td>' + esc(c.phone) + '</td>' +
+        '<td>' + esc(c.email) + '</td><td class="n">' + c.openCases + '件</td></tr>';
+    }).join('') || '<tr class="empty"><td colspan="5">取引先はまだありません</td></tr>';
+  }
+
+  $('tblClients').querySelector('tbody').addEventListener('click', function (e) {
+    var tr = e.target.closest('tr[data-id]'); if (!tr) return;
+    openClientForm(state.clientList.filter(function (c) { return c.id === tr.dataset.id; })[0]);
+  });
+  $('btnNewClient').addEventListener('click', function () { openClientForm(null); });
+
+  function openClientForm(c) {
+    var isNew = !c;
+    var w = canWrite();
+    function field(id, label, value, type, span, required) {
+      return '<label' + (span ? ' class="span2"' : '') + '><span class="cap">' + label + (required ? ' <span class="req">必須</span>' : '') + '</span>' +
+        '<input id="' + id + '" type="' + type + '" value="' + esc(value || '') + '"' + (w ? '' : ' disabled') + '></label>';
+    }
+    modal('<h3>' + (isNew ? '取引先を登録' : '取引先') + '</h3>' + (isNew ? '<div style="height:12px"></div>' : '<p class="modal-sub">' + esc(c.id) + '</p>') +
+      '<div class="form-grid2">' +
+        field('cfName', '名称', c && c.name, 'text', true, true) +
+        field('cfContact', '先方担当者', c && c.contact, 'text', false, false) +
+        field('cfPhone', '電話', c && c.phone, 'tel', false, false) +
+        field('cfEmail', 'メール', c && c.email, 'email', true, false) +
+        field('cfAddress', '住所', c && c.address, 'text', true, false) +
+        '<label class="span2"><span class="cap">備考</span><textarea id="cfNote" rows="3"' + (w ? '' : ' disabled') + '>' + esc(c ? c.note : '') + '</textarea></label>' +
+      '</div>' +
+      '<div class="alert hidden" id="cfAlert"></div>' +
+      '<div class="actions"><button class="btn" id="cfCancel">閉じる</button>' + (w ? '<button class="btn primary" id="cfSave">' + (isNew ? '登録する' : '保存する') + '</button>' : '') + '</div>');
+    $('cfCancel').onclick = closeModal;
+    if (!w) return;
+    $('cfSave').onclick = function () {
+      var p = { id: isNew ? '' : c.id, name: $('cfName').value, contact: $('cfContact').value, phone: $('cfPhone').value, email: $('cfEmail').value, address: $('cfAddress').value, note: $('cfNote').value };
+      markBad('cfName', !p.name.trim());
+      busy($('cfSave'), call('apiSaveClient', p)).then(function () {
+        closeModal();
+        toast(isNew ? '取引先を登録しました' : '取引先を保存しました', 'ok');
+        return loadClients();
+      }).catch(function (e) { showAlert('cfAlert', errText(e)); });
+    };
+    $('cfName').focus();
+  }
+
+  /* ============================================================
+   * 対応履歴
+   * ============================================================ */
+
+  function fillHistoryFilters() {
+    $('hBy').innerHTML = '<option value="all">すべての記入者</option>' + state.users.map(function (u) {
+      return '<option value="' + esc(u.email) + '">' + esc(u.short) + '</option>';
+    }).join('');
+    var kinds = state.kinds.concat([HANDOVER], SYSTEM_KINDS);
+    $('hKind').innerHTML = '<option value="all">すべての種別</option>' + kinds.map(function (k) {
+      return '<option value="' + esc(k) + '">' + esc(k) + '</option>';
+    }).join('');
+  }
+
+  function loadHistory() {
+    return call('apiListHistory').then(function (list) {
+      state.histAll = list;
+      renderHistory();
+      showView('history');
+    }).catch(fail);
+  }
+
+  function renderHistory() {
+    var f = state.hist;
+    var rows = state.histAll.filter(function (h) { return (f.by === 'all' || h.by === f.by) && (f.kind === 'all' || h.kind === f.kind); });
+    $('histCount').textContent = rows.length + '件';
+    $('histList').innerHTML = rows.length ? rows.map(function (h) { return entryHtml(h, true); }).join('')
+      : '<li class="fi"><div class="fi-text muted">条件に合う対応履歴はありません</div></li>';
+  }
+
+  $('hBy').addEventListener('change', function () { state.hist.by = this.value; renderHistory(); });
+  $('hKind').addEventListener('change', function () { state.hist.kind = this.value; renderHistory(); });
+  $('histList').addEventListener('click', function (e) {
+    var li = e.target.closest('li[data-no]'); if (li) openCase(li.dataset.no);
+  });
+})();
+</script>
